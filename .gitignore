@@ -1,0 +1,7 @@
+*.a00
+*.h00
+*.res
+*.bis
+*.png
+point.smc
+__pycache__
