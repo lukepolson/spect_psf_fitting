@@ -41,5 +41,5 @@ def get_projections_spacing_radius(headerfile: str):
         headerdata = f.readlines()
     headerdata = np.array(headerdata)
     radius = float(find_first_entry_containing_header(headerdata, 'UpperEneWindowTresh:', str).split(':')[-1])
-    return projections, (dx, dz), radius 
+    return projections.T, (dx, dz), radius 
     

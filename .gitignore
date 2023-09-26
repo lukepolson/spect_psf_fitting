@@ -3,5 +3,6 @@
 *.res
 *.bis
 *.png
+*.pkl
 point.smc
 __pycache__
