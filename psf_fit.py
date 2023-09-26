@@ -17,6 +17,37 @@ def get_psf_kernel(projection_paths):
         psfs_data.append(projections)
         distances.append(distance)
     return fit(np.array(psfs_data), np.array(distances), dr)[0]
+
+# Kernel function: note, when returned by "fit", only takes in x, y, and d; rest of the arguments given as default based on the fit
+def kernel(
+    x,
+    y,
+    d,
+    dr,
+    gaus_sigma_fit,
+    gaus_amplitude_fit,
+    spline_sigma_fit,
+    spline_amplitude_fit,
+    min_spline_sigma,
+    tck,
+    x_data,
+    y_data,
+    gaus_only=False,
+    spline_only=False):
+        x_new = x/dr[0] # in units of voxels corresponding to original fit
+        y_new = y/dr[1] # in units of voxels corresponding to original fit
+        x_grid, y_grid = np.meshgrid(x_new, y_new)
+        gaus_comp = gaus(x_grid, y_grid, [0, 0, sqrt_fit(d, *gaus_sigma_fit), dual_exponential(d, *gaus_amplitude_fit)])
+        spline_sigma = sqrt_fit(d, *spline_sigma_fit)
+        spline_comp = dual_exponential(d, *spline_amplitude_fit)*bisplev(x_new/spline_sigma, y_new/spline_sigma, tck)
+        C = spline_sigma/min_spline_sigma
+        spline_comp[(x_grid>C*x_data.max())+(x_grid<C*x_data.min())+(y_grid>C*y_data.max())+(y_grid<C*y_data.min())] = 0 # set outside fitted boundaries equal to zero
+        if gaus_only:
+            return gaus_comp
+        elif spline_only:
+            return spline_comp
+        else:
+            return gaus_comp + spline_comp
         
 def fit(psfs_data, distances, dr=(1,1), spline_order=3, N_points=64, negativity_loss_scaling=20):
     N = psfs_data.shape[0]
@@ -70,22 +101,11 @@ def fit(psfs_data, distances, dr=(1,1), spline_order=3, N_points=64, negativity_
     gaus_params_opt = params_opt[:4*N].reshape((N,-1))
     bh_opt = params_opt[4*N:5*N]
     bs_opt = params_opt[5*N:6*N]
+    min_spline_sigma = np.min(bs_opt)
     tck[2] = params_opt[6*N:]
     gaus_amplitude_fit = curve_fit(dual_exponential, distances, gaus_params_opt[:,-1])[0]
     gaus_sigma_fit = curve_fit(sqrt_fit, distances, gaus_params_opt[:,-2])[0]
     spline_amplitude_fit = curve_fit(dual_exponential, distances, bh_opt)[0]
     spline_sigma_fit = curve_fit(sqrt_fit, distances, bs_opt)[0]
-    def return_function(x, y, d, gaus_only=False, spline_only=False):
-        x_new = x/dr[0] # in units of voxels corresponding to original fit
-        y_new = y/dr[1] # in units of voxels corresponding to original fit
-        x_grid, y_grid = np.meshgrid(x_new, y_new)
-        gaus_comp = gaus(x_grid, y_grid, [0, 0, sqrt_fit(d, *gaus_sigma_fit), dual_exponential(d, *gaus_amplitude_fit)])
-        spline_comp = dual_exponential(d, *spline_amplitude_fit)*bisplev(x_new/sqrt_fit(d, *spline_sigma_fit), y_new/sqrt_fit(d, *spline_sigma_fit), tck)
-        spline_comp[(x_grid>x_data.max())+(x_grid<x_data.min())+(y_grid>y_data.max())+(y_grid<y_data.min())] = 0 # set outside fitted boundaries equal to zero
-        if gaus_only:
-            return gaus_comp
-        elif spline_only:
-            return spline_comp
-        else:
-            return gaus_comp + spline_comp
+    return_function = lambda x, y, d: kernel(x, y, d, dr, gaus_sigma_fit, gaus_amplitude_fit, spline_sigma_fit, spline_amplitude_fit, min_spline_sigma, tck, x_data, y_data, gaus_only=False, spline_only=False)
     return return_function, params_opt
