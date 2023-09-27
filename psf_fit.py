@@ -7,6 +7,7 @@ from scipy.optimize import curve_fit
 from fit_functions import dual_exponential, sqrt_fit, gaus, initial_gaus_estimate
 from loss_functions import negativity_loss
 from load_data import get_projections_spacing_radius
+from scipy.integrate import dblquad
 
 # Unfortunately distances have to be provided seperately because not stored in STATIC SPECT scan .h00 files (single projection)
 def get_psf_kernel(projection_paths):
@@ -32,15 +33,19 @@ def kernel(
     tck,
     x_data,
     y_data,
+    L,
     gaus_only=False,
     spline_only=False,
     normalize=True):
         x_new = x/dr[0] # in units of voxels corresponding to original fit
         y_new = y/dr[1] # in units of voxels corresponding to original fit
         x_grid, y_grid = np.meshgrid(x_new, y_new)
-        gaus_comp = gaus(x_grid, y_grid, [0, 0, sqrt_fit(d, *gaus_sigma_fit), dual_exponential(d, *gaus_amplitude_fit)])
+        gaus_sigma = sqrt_fit(d, *gaus_sigma_fit)
+        gaus_amplitude = dual_exponential(d, *gaus_amplitude_fit)
+        gaus_comp = gaus(x_grid, y_grid, [0, 0, gaus_sigma, gaus_amplitude])
         spline_sigma = sqrt_fit(d, *spline_sigma_fit)
-        spline_comp = dual_exponential(d, *spline_amplitude_fit)*bisplev(x_new/spline_sigma, y_new/spline_sigma, tck)
+        spline_amplitude = dual_exponential(d, *spline_amplitude_fit)
+        spline_comp = spline_amplitude*bisplev(x_new/spline_sigma, y_new/spline_sigma, tck)
         C = spline_sigma/min_spline_sigma
         spline_comp[(x_grid>C*x_data.max())+(x_grid<C*x_data.min())+(y_grid>C*y_data.max())+(y_grid<C*y_data.min())] = 0 # set outside fitted boundaries equal to zero
         if gaus_only:
@@ -51,7 +56,10 @@ def kernel(
             k = gaus_comp + spline_comp
         # potentially normalize
         if normalize:
-            k = k/k.sum()
+            dx = np.diff(x_new)[0]
+            dy = np.diff(y_new)[0]
+            N = gaus_amplitude * (2*np.pi) * (gaus_sigma/dx)*(gaus_sigma/dy)  + spline_amplitude * L *(spline_sigma/dx)*(spline_sigma/dy)
+            k = k/N
         return k
             
         
@@ -113,5 +121,8 @@ def fit(psfs_data, distances, dr=(1,1), spline_order=3, N_points=64, negativity_
     gaus_sigma_fit = curve_fit(sqrt_fit, distances, gaus_params_opt[:,-2])[0]
     spline_amplitude_fit = curve_fit(dual_exponential, distances, bh_opt)[0]
     spline_sigma_fit = curve_fit(sqrt_fit, distances, bs_opt)[0]
-    return_function = lambda x, y, d, normalize=True: kernel(x, y, d, dr, gaus_sigma_fit, gaus_amplitude_fit, spline_sigma_fit, spline_amplitude_fit, min_spline_sigma, tck, x_data, y_data, gaus_only=False, spline_only=False, normalize=normalize)
+    # For kernel normalization
+    L = dblquad(lambda x, y: bisplev(x, y, tck), x_data.min()/min_spline_sigma, x_data.max()/min_spline_sigma, y_data.min()/min_spline_sigma, y_data.max()/min_spline_sigma)[0]
+    # Returned kernel
+    return_function = lambda x, y, d, normalize=True, gaus_only=False, spline_only=False: kernel(x, y, d, dr, gaus_sigma_fit, gaus_amplitude_fit, spline_sigma_fit, spline_amplitude_fit, min_spline_sigma, tck, x_data, y_data, L, gaus_only=gaus_only, spline_only=spline_only, normalize=normalize)
     return return_function, params_opt
