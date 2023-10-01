@@ -4,7 +4,7 @@ import numpy as np
 from scipy.interpolate import bisplev
 from scipy.optimize import minimize
 from scipy.optimize import curve_fit
-from fit_functions import dual_exponential, sqrt_fit, gaus, initial_gaus_estimate
+from fit_part1 import dual_exponential, sqrt_fit, gaus, initial_gaus_estimate
 from loss_functions import negativity_loss
 from load_data import get_projections_spacing_radius
 from scipy.integrate import dblquad

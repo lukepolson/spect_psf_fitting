@@ -4,6 +4,8 @@ from kornia.geometry.transform import rotate
 import pytomography
 from pytomography.utils import pad_object_z, unpad_object_z
 import torch.nn as nn
+from scipy.optimize import curve_fit
+from scipy.interpolate import CubicSpline
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def dual_exponential(d, b1, b2, b3, b4):
@@ -36,7 +38,7 @@ class PSFNet(nn.Module):
         Iiso = self.iso_spline_f.integrate(min(self.iso_spline_f.x), max(self.iso_spline_f.x))
         Nw = 3*self.bkg_amplitudes* Iw * self.bkg_sigmas 
         Niso = self.bkg_amplitudes *Iiso * self.bkg_sigmas
-        Ng2 = (self.gaus_amplitudes * 2 * np.pi * self.gaus_sigmas**2) * (self.dr0[0] / self.dr)**2
+        Ng2 = (self.gaus_amplitudes * 2 * np.pi * self.gaus_sigmas**2) * (self.dr0 / self.dr)**2
         normalization_factor = (Nw+Niso**2+1)*Ng2
         self.normalization_factor = torch.tensor(normalization_factor).to(pytomography.device)
         # Now get layers
@@ -49,7 +51,7 @@ class PSFNet(nn.Module):
         N = len(self.distances)
         layer = nn.Conv1d(N, N, self.kernel_size, groups=N, padding='same',
                         padding_mode='zeros', bias=0, device=pytomography.device)
-        x = torch.arange(-int(self.kernel_size//2), int(self.kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1)) * self.dr / self.dr0[0]
+        x = torch.arange(-int(self.kernel_size//2), int(self.kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1)) * self.dr / self.dr0
         gaus_amplitudes = torch.tensor(self.gaus_amplitudes).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         gaus_sigmas = torch.tensor(self.gaus_sigmas).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         kernel = torch.sqrt(gaus_amplitudes) * torch.exp(-x**2 / (2*gaus_sigmas**2 + pytomography.delta))
@@ -62,10 +64,10 @@ class PSFNet(nn.Module):
         bkg_sigmas = torch.tensor(self.bkg_sigmas).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         layer = nn.Conv1d(N, N, self.kernel_size, groups=N, padding='same',
                         padding_mode='zeros', bias=0, device=pytomography.device)
-        x = torch.arange(-int(self.kernel_size//2), int(self.kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1))  * self.dr / self.dr0[0] / bkg_sigmas
+        x = torch.arange(-int(self.kernel_size//2), int(self.kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1))  * self.dr / self.dr0 / bkg_sigmas
         components = spline_f(x.cpu().numpy())
         components[np.isnan(components)] = 0
-        kernel = bkg_amplitudes * self.dr/self.dr0[0] * torch.tensor(components).to(pytomography.device)
+        kernel = bkg_amplitudes * self.dr/self.dr0 * torch.tensor(components).to(pytomography.device)
         layer.weight.data = kernel.to(pytomography.dtype)
         return layer
 
@@ -87,3 +89,20 @@ class PSFNet(nn.Module):
         tails = unpad_object_z(tails, pad_size).squeeze()
         output = (output  + tails + iso)/self.normalization_factor.unsqueeze(1).unsqueeze(1)
         return output.unsqueeze(0)
+    
+def get_psf_net(distances, dr0, projectionss_data, w, iso, g_params, SA):
+    bkg_amplitude = SA[1]
+    bkg_sigma = SA[0]
+    gaus_amplitude = g_params[:,0].detach().cpu().numpy()
+    gaus_sigma = g_params[:,1].detach().cpu().numpy()
+    
+    gaus_amplitude_fit = curve_fit(dual_exponential, distances, gaus_amplitude)[0]
+    gaus_sigma_fit = curve_fit(sqrt_fit, distances, gaus_sigma)[0]
+    bkg_amplitude_fit = curve_fit(dual_exponential, distances, bkg_amplitude)[0]
+    bkg_sigma_fit = curve_fit(sqrt_fit, distances, bkg_sigma)[0]
+    
+    Nx = projectionss_data.shape[1]
+    x = np.arange(-Nx/2+0.5, Nx/2+0.5, 1)
+    w_spline_f = CubicSpline(x, w[0,0].detach().cpu().numpy(), extrapolate=False)
+    iso_spline_f = CubicSpline(x, iso[0,0].detach().cpu().numpy(), extrapolate=False)
+    return PSFNet(gaus_amplitude_fit, gaus_sigma_fit, bkg_amplitude_fit, bkg_sigma_fit, w_spline_f, iso_spline_f, dr0)
