@@ -6,7 +6,6 @@ from pytomography.utils import pad_object_z, unpad_object_z
 import torch.nn as nn
 from scipy.optimize import curve_fit
 from scipy.interpolate import CubicSpline
-from fft_conv_pytorch import FFTConv1d, FFTConv2d
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def dual_exponential(d, b1, b2, b3, b4):
@@ -15,30 +14,16 @@ def dual_exponential(d, b1, b2, b3, b4):
 def sqrt_fit(d, b1, b2):
     return b1*d+b2
 
-# Used for timing comparison in paper: not for implementation of PSFNet
-class JaggedConv2D(nn.Module):
-    def __init__(self, psf_net, distances, dr, fft=False):
-        super(JaggedConv2D, self).__init__()
-        self.fft = fft
-        psf_net.configure(distances, dr)
-        kernel_sizes = psf_net.kernel_sizes
-        kernel_size_max = psf_net.kernel_size_max
-        x = torch.zeros((1,len(distances),kernel_size_max, kernel_size_max)).to(pytomography.device)
-        x[:,:,kernel_size_max//2,kernel_size_max//2] = 1
-        kernel = psf_net(x, padding=False)
-        
-        # Create a list of convolution layers with different kernel sizes
-        self.conv_layers = nn.ModuleList()
-        for kernel_size in kernel_sizes:
-            if self.fft:
-                layer = FFTConv2d(in_channels=1, out_channels=1, kernel_size=kernel_size, padding='same', padding_mode='constant', bias=0)
-            else:
-                layer = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=kernel_size, padding='same', padding_mode='zeros', bias=0)
+class Jagged1DConv(nn.Module):
+    def __init__(self, kernel, kernel_sizes):
+        super(Jagged1DConv, self).__init__()
+        self.conv_layers = []
+        for i, kernel_size in enumerate(kernel_sizes):
+            layer = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=kernel_size, padding='same', padding_mode='zeros', bias=0)
             start_idx = (kernel.shape[2] - kernel_size) // 2
-            layer.weight.data = kernel[:,0,start_idx:start_idx+kernel_size,start_idx:start_idx+kernel_size].unsqueeze(0)
+            layer.weight.data = kernel[i,:,start_idx:start_idx+kernel_size].unsqueeze(0)
             self.conv_layers.append(layer)
-            
-    @torch.no_grad()
+
     def forward(self, x):
         input_channels = x.split(1, dim=1)
         conv_results = [conv(input_channel) for conv, input_channel in zip(self.conv_layers, input_channels)]
@@ -57,9 +42,8 @@ class PSFNet(nn.Module):
         self.dr0 = dr0
         self.kernel_size0 = kernel_size0
         
-        
-    def configure(self, distances, dr, fft=False):
-        self.fft = fft
+    def configure(self, distances, dr, kernel_size):
+        self.kernel_size = kernel_size
         self.distances = distances
         self.dr = dr
         self.gaus_amplitudes = dual_exponential(self.distances, *self.gaus_amplitude_fit)
@@ -68,7 +52,7 @@ class PSFNet(nn.Module):
         self.bkg_sigmas = sqrt_fit(self.distances, *self.bkg_sigma_fit)
         self.kernel_sizes = np.ceil(self.bkg_sigmas * self.dr0/dr * self.kernel_size0).astype(int)
         self.kernel_sizes[self.kernel_sizes%2==0] +=1
-        self.kernel_size_max = self.kernel_sizes.max()
+        self.max_kernel_size = self.kernel_sizes.max()
         # Get normalization factor
         Iw = self.w_spline_f.integrate(min(self.w_spline_f.x), max(self.w_spline_f.x))
         Iiso = self.iso_spline_f.integrate(min(self.iso_spline_f.x), max(self.iso_spline_f.x))
@@ -85,30 +69,22 @@ class PSFNet(nn.Module):
         
     def get_gaus_layer(self):
         N = len(self.distances)
-        x = torch.arange(-int(self.kernel_size_max//2), int(self.kernel_size_max//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1)) * self.dr / self.dr0
+        x = torch.arange(-int(self.max_kernel_size//2), int(self.max_kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1)) * self.dr / self.dr0
         gaus_amplitudes = torch.tensor(self.gaus_amplitudes).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         gaus_sigmas = torch.tensor(self.gaus_sigmas).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         kernel = torch.sqrt(gaus_amplitudes) * torch.exp(-x**2 / (2*gaus_sigmas**2 + pytomography.delta))
-        if self.fft:
-            layer = FFTConv1d(N, N, self.kernel_size_max, groups=N, padding='same', padding_mode='constant', bias=0).to(pytomography.device)
-        else:
-            layer = nn.Conv1d(N, N, self.kernel_size_max, groups=N, padding='same', padding_mode='zeros', bias=0, device=pytomography.device)
-        layer.weight.data = kernel.to(pytomography.dtype)
+        layer = Jagged1DConv(kernel.to(pytomography.dtype), self.kernel_sizes)
         return layer
 
     def get_bkg_layers(self, spline_f):
         N = len(self.distances)
         bkg_amplitudes = torch.tensor(self.bkg_amplitudes).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
         bkg_sigmas = torch.tensor(self.bkg_sigmas).to(pytomography.device).to(pytomography.dtype).reshape((N,1,1))
-        x = torch.arange(-int(self.kernel_size_max//2), int(self.kernel_size_max//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1))  * self.dr / self.dr0 / bkg_sigmas
+        x = torch.arange(-int(self.max_kernel_size//2), int(self.max_kernel_size//2)+1).to(pytomography.device).unsqueeze(0).unsqueeze(0).repeat((N,1,1))  * self.dr / self.dr0 / bkg_sigmas
         components = spline_f(x.cpu().numpy())
         components[np.isnan(components)] = 0
         kernel = bkg_amplitudes * self.dr/self.dr0 * torch.tensor(components).to(pytomography.device)
-        if self.fft:
-            layer = FFTConv1d(N, N, self.kernel_size_max, groups=N, padding='same', padding_mode='constant', bias=0).to(pytomography.device)
-        else:
-            layer = nn.Conv1d(N, N, self.kernel_size_max, groups=N, padding='same', padding_mode='zeros', bias=0, device=pytomography.device)
-        layer.weight.data = kernel.to(pytomography.dtype)
+        layer = Jagged1DConv(kernel.to(pytomography.dtype), self.kernel_sizes)
         return layer
 
     @torch.no_grad()
@@ -137,7 +113,7 @@ class PSFNet(nn.Module):
             output /= self.normalization_factor.unsqueeze(1).unsqueeze(1)
         return output.unsqueeze(0)
     
-def get_psf_net(distances, dr0, projectionss_data, w, iso, g_params, SA):
+def get_psf_net(distances, dr0, projectionss_data, w, iso, g_params, SA, kernel_size0):
     bkg_amplitude = SA[1]
     bkg_sigma = SA[0]
     gaus_amplitude = g_params[:,0].detach().cpu().numpy()
@@ -152,4 +128,4 @@ def get_psf_net(distances, dr0, projectionss_data, w, iso, g_params, SA):
     x = np.arange(-Nx/2+0.5, Nx/2+0.5, 1)
     w_spline_f = CubicSpline(x, w[0,0].detach().cpu().numpy(), extrapolate=False)
     iso_spline_f = CubicSpline(x, iso[0,0].detach().cpu().numpy(), extrapolate=False)
-    return PSFNet(gaus_amplitude_fit, gaus_sigma_fit, bkg_amplitude_fit, bkg_sigma_fit, w_spline_f, iso_spline_f, dr0)
+    return PSFNet(gaus_amplitude_fit, gaus_sigma_fit, bkg_amplitude_fit, bkg_sigma_fit, w_spline_f, iso_spline_f, dr0, kernel_size0)

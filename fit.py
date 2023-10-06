@@ -19,7 +19,7 @@ def fit(projectionss_data, idx=0):
     def loss(params):
         return np.sum((gaus(rv, params) - projectionss_data)**2)
     
-    gaus_params_init = np.ones(20)
+    gaus_params_init = np.ones(2*projectionss_data.shape[0])
     gaus_params_init[::2] = np.max(projectionss_data, axis=(1,2))
     gaus_params_opt = minimize(loss, gaus_params_init).x
     gaus_params_opt = gaus_params_opt.reshape(-1,2) 
@@ -86,13 +86,13 @@ def fit(projectionss_data, idx=0):
     # Adjust other kernels
     def loss(SA):
         err = 0
-        for i in range(10):
+        for i in range(projectionss_data.shape[0]):
             pred = fit_func(w, iso, g_params, SA, i)
             err += np.sum((pred.detach().cpu().numpy() - projectionss_data[i].detach().cpu().numpy())**2)
         return err
     
     #TODO: Adjust parameters such as number of loops, learning rate, n_iters
-    for n in range(20):
+    for n in range(5):
         lr = 2e-4 / (n/3+1)
         SA = minimize(loss, SA.ravel(), method='COBYLA').x
         SA = SA.reshape(2,-1)

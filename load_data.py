@@ -19,8 +19,8 @@ def find_first_entry_containing_header(
     elif dtype == int:
         return int(line.replace('\n', '').split(':=')[-1].replace(' ', ''))
     
-def get_projections_spacing_radius(headerfile: str):
-    with open(f'{headerfile}_tot_w1.h00') as f:
+def get_projections_spacing_radius(headerfile: str, substr='tot'):
+    with open(f'{headerfile}_{substr}_w1.h00') as f:
         headerdata = f.readlines()
     headerdata = np.array(headerdata)
     num_proj = find_first_entry_containing_header(headerdata, 'total number of images', int)
@@ -42,4 +42,10 @@ def get_projections_spacing_radius(headerfile: str):
     headerdata = np.array(headerdata)
     radius = float(find_first_entry_containing_header(headerdata, 'UpperEneWindowTresh:', str).split(':')[-1])
     return projections.T, (dx, dz), radius 
+
+def get_data(headerfile):
+    total, _, _ = get_projections_spacing_radius(headerfile)
+    scatter, dr, radius = get_projections_spacing_radius(headerfile, substr='sca')
+    primary = total-scatter
+    return primary, dr, radius
     
