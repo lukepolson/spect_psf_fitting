@@ -3,10 +3,9 @@ import torch
 from torch.nn.functional import interpolate
 from kornia.geometry.transform import rotate
 import torch.nn.functional as F
-from scipy.optimize import minimize
+from scipy.optimize import minimize, Bounds
 
-def fit(projectionss_data, idx=0):
-    
+def fit(projectionss_data, idx=0, alpha1=100, alpha2=10,alpha3=10):
     # Part 1: Get initial Gaussian parameters
     Nx = projectionss_data.shape[1]
     xv, yv = np.meshgrid(*2*[np.arange(-Nx/2+0.5, Nx/2+0.5, 1)])
@@ -22,7 +21,12 @@ def fit(projectionss_data, idx=0):
     gaus_params_init = np.ones(2*projectionss_data.shape[0])
     gaus_params_init[::2] = np.max(projectionss_data, axis=(1,2))
     gaus_params_opt = minimize(loss, gaus_params_init).x
-    gaus_params_opt = gaus_params_opt.reshape(-1,2) 
+    gaus_params_opt = gaus_params_opt.reshape(-1,2)
+    
+    mini_gaus_params = np.zeros(2*projectionss_data.shape[0])
+    mini_gaus_params[::2] = projectionss_data.max(axis=(1,2)) - gaus_params_opt[:,0]
+    mini_gaus_params[1::2] = gaus_params_opt[:,1] / 5
+    mini_gaus_params = mini_gaus_params.reshape(-1,2)
     
     # Part 2: Get parameters for projections at each radial distance
     def gaus(x,params):
@@ -34,6 +38,8 @@ def fit(projectionss_data, idx=0):
     rv = torch.sqrt(xv**2+yv**2)
     g_params = torch.tensor(gaus_params_opt, requires_grad=True)
     g_params.retain_grad()
+    mini_g_params = torch.tensor(mini_gaus_params, requires_grad=True)
+    mini_g_params.retain_grad()
     w = torch.ones(1,1,Nx,requires_grad=True)*0.002
     w.retain_grad()
     iso = torch.ones(1,1,Nx,requires_grad=True)*0.0002
@@ -42,12 +48,13 @@ def fit(projectionss_data, idx=0):
     amplitudes = np.ones(projectionss_data.shape[0])
     SA = np.vstack([scale_factors,amplitudes])
     
-    def fit_func(w, iso, g_params, SA, idx):
+    def fit_func(w, iso, g_params, mini_g_params, SA, idx):
         scale_factors = SA.reshape(2,-1)[0]
+        scale_factors[scale_factors<1] = 1
         amplitudes = SA.reshape(2,-1)[1]
         w_s = amplitudes[idx] * interpolate(w,scale_factor=scale_factors[idx], mode='linear')
         iso_s = amplitudes[idx] * interpolate(iso,scale_factor=scale_factors[idx], mode='linear')
-        x = gaus(rv, g_params[idx]).unsqueeze(1)
+        x = gaus(rv, g_params[idx]).unsqueeze(1) + gaus(rv, mini_g_params[idx]).unsqueeze(1)
         y = F.conv1d(x,w_s,padding='same')
         tot = torch.clone(x)
         #TODO: Update for non-hexagonal configs
@@ -60,7 +67,7 @@ def fit(projectionss_data, idx=0):
         tot = tot.swapaxes(0,1)
         return tot
     
-    def train_w(w, iso, g_params, SA, n_iters, lr=1e-3, idx=None):
+    def train_w(w, iso, g_params, mini_g_params, SA, n_iters, lr=1e-3, idx=None):
         for i in range(n_iters):
             if w.grad is not None:
                 w.grad.zero_()
@@ -68,26 +75,29 @@ def fit(projectionss_data, idx=0):
                 iso.grad.zero_()
             if g_params.grad is not None:
                 g_params.grad.zero_()
+            if mini_g_params.grad is not None:
+                mini_g_params.grad.zero_()
             error = 0
             for i in range(projectionss_data.shape[0]):
                 if idx is not None:
                     if i!=idx:
                         continue
-                pred = fit_func(w, iso, g_params, SA, i)
-                error += torch.sum((pred-projectionss_data[i])**2) + 100*torch.sum(w[w<0]**2) + 10*torch.sum(torch.diff(SA[1,i]*w)**2) + 10*torch.sum(torch.diff(SA[1,i]*iso)**2)
+                pred = fit_func(w, iso, g_params, mini_g_params, SA, i)
+                error += torch.sum((pred-projectionss_data[i])**2) + alpha1*torch.sum(w[w<0]**2) + alpha2*torch.sum(torch.diff(SA[1,i]*w)**2) + alpha3*torch.sum(torch.diff(SA[1,i]*iso)**2)
             error.backward()
             w = (w.data - lr * w.grad).requires_grad_(True)
             iso = (iso.data - lr * iso.grad).requires_grad_(True)
             g_params = (g_params.data - lr * g_params.grad).requires_grad_(True)
-        return w, iso, g_params
+            mini_g_params = (mini_g_params.data - lr * mini_g_params.grad).requires_grad_(True)
+        return w, iso, g_params, mini_g_params
     
-    w, iso, g_params = train_w(w, iso, g_params, SA, n_iters=1000, idx=idx)
+    w, iso, g_params, mini_g_params = train_w(w, iso, g_params, mini_g_params, SA, n_iters=1000, idx=idx)
     
     # Adjust other kernels
     def loss(SA):
         err = 0
         for i in range(projectionss_data.shape[0]):
-            pred = fit_func(w, iso, g_params, SA, i)
+            pred = fit_func(w, iso, g_params, mini_g_params, SA, i)
             err += np.sum((pred.detach().cpu().numpy() - projectionss_data[i].detach().cpu().numpy())**2)
         return err
     
@@ -96,7 +106,5 @@ def fit(projectionss_data, idx=0):
         lr = 2e-4 / (n/3+1)
         SA = minimize(loss, SA.ravel(), method='COBYLA').x
         SA = SA.reshape(2,-1)
-        w, iso, g_params = train_w(w, iso, g_params, SA, n_iters=200, lr=lr)
-        
-
-    return w, iso, g_params, SA, fit_func
+        w, iso, g_params, mini_g_params = train_w(w, iso, g_params, mini_g_params, SA, n_iters=200, lr=lr)
+    return w, iso, g_params, mini_g_params, SA, fit_func
